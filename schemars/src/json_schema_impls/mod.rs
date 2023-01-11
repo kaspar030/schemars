@@ -54,6 +54,8 @@ mod either;
 #[cfg(feature = "enumset")]
 mod enumset;
 mod ffi;
+#[cfg(feature = "im")]
+mod im;
 #[cfg(feature = "indexmap")]
 mod indexmap;
 mod maps;

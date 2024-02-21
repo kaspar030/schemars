@@ -43,13 +43,17 @@ pub struct ValidationAttrs {
     contains: Option<String>,
     required: bool,
     format: Option<Format>,
+    inner: Option<Box<ValidationAttrs>>,
 }
 
 impl ValidationAttrs {
     pub fn new(attrs: &[syn::Attribute], errors: &Ctxt) -> Self {
+        let schemars_items = get_meta_items(attrs, "schemars", errors, false);
+        let validate_items = get_meta_items(attrs, "validate", errors, true);
+
         ValidationAttrs::default()
-            .populate(attrs, "schemars", false, errors)
-            .populate(attrs, "validate", true, errors)
+            .populate(schemars_items, "schemars", false, errors)
+            .populate(validate_items, "validate", true, errors)
     }
 
     pub fn required(&self) -> bool {
@@ -58,7 +62,7 @@ impl ValidationAttrs {
 
     fn populate(
         mut self,
-        attrs: &[syn::Attribute],
+        meta_items: Vec<syn::NestedMeta>,
         attr_type: &'static str,
         ignore_errors: bool,
         errors: &Ctxt,
@@ -97,11 +101,7 @@ impl ValidationAttrs {
             }
         };
 
-        for meta_item in attrs
-            .iter()
-            .flat_map(|attr| get_meta_items(attr, attr_type, errors, ignore_errors))
-            .flatten()
-        {
+        for meta_item in meta_items {
             match &meta_item {
                 NestedMeta::Meta(Meta::List(meta_list)) if meta_list.path.is_ident("length") => {
                     for nested in meta_list.nested.iter() {
@@ -112,7 +112,7 @@ impl ValidationAttrs {
                                 } else if self.length_equal.is_some() {
                                     mutual_exclusive_error(&nv.path, "equal")
                                 } else {
-                                    self.length_min = str_or_num_to_expr(&errors, "min", &nv.lit);
+                                    self.length_min = str_or_num_to_expr(errors, "min", &nv.lit);
                                 }
                             }
                             NestedMeta::Meta(Meta::NameValue(nv)) if nv.path.is_ident("max") => {
@@ -121,7 +121,7 @@ impl ValidationAttrs {
                                 } else if self.length_equal.is_some() {
                                     mutual_exclusive_error(&nv.path, "equal")
                                 } else {
-                                    self.length_max = str_or_num_to_expr(&errors, "max", &nv.lit);
+                                    self.length_max = str_or_num_to_expr(errors, "max", &nv.lit);
                                 }
                             }
                             NestedMeta::Meta(Meta::NameValue(nv)) if nv.path.is_ident("equal") => {
@@ -133,14 +133,14 @@ impl ValidationAttrs {
                                     mutual_exclusive_error(&nv.path, "max")
                                 } else {
                                     self.length_equal =
-                                        str_or_num_to_expr(&errors, "equal", &nv.lit);
+                                        str_or_num_to_expr(errors, "equal", &nv.lit);
                                 }
                             }
                             meta => {
                                 if !ignore_errors {
                                     errors.error_spanned_by(
                                         meta,
-                                        format!("unknown item in schemars length attribute"),
+                                        "unknown item in schemars length attribute".to_string(),
                                     );
                                 }
                             }
@@ -155,21 +155,21 @@ impl ValidationAttrs {
                                 if self.range_min.is_some() {
                                     duplicate_error(&nv.path)
                                 } else {
-                                    self.range_min = str_or_num_to_expr(&errors, "min", &nv.lit);
+                                    self.range_min = str_or_num_to_expr(errors, "min", &nv.lit);
                                 }
                             }
                             NestedMeta::Meta(Meta::NameValue(nv)) if nv.path.is_ident("max") => {
                                 if self.range_max.is_some() {
                                     duplicate_error(&nv.path)
                                 } else {
-                                    self.range_max = str_or_num_to_expr(&errors, "max", &nv.lit);
+                                    self.range_max = str_or_num_to_expr(errors, "max", &nv.lit);
                                 }
                             }
                             meta => {
                                 if !ignore_errors {
                                     errors.error_spanned_by(
                                         meta,
-                                        format!("unknown item in schemars range attribute"),
+                                        "unknown item in schemars range attribute".to_string(),
                                     );
                                 }
                             }
@@ -247,7 +247,8 @@ impl ValidationAttrs {
                                         if !ignore_errors {
                                             errors.error_spanned_by(
                                                 meta,
-                                                format!("unknown item in schemars regex attribute"),
+                                                "unknown item in schemars regex attribute"
+                                                    .to_string(),
                                             );
                                         }
                                     }
@@ -261,8 +262,8 @@ impl ValidationAttrs {
                     if path.is_ident("contains") =>
                 {
                     match (&self.contains, &self.regex) {
-                        (Some(_), _) => duplicate_error(&path),
-                        (None, Some(_)) => mutual_exclusive_error(&path, "regex"),
+                        (Some(_), _) => duplicate_error(path),
+                        (None, Some(_)) => mutual_exclusive_error(path, "regex"),
                         (None, None) => {
                             self.contains = get_lit_str(errors, attr_type, "contains", lit)
                                 .map(|litstr| litstr.value())
@@ -292,14 +293,28 @@ impl ValidationAttrs {
                                         if !ignore_errors {
                                             errors.error_spanned_by(
                                                 meta,
-                                                format!(
-                                                    "unknown item in schemars contains attribute"
-                                                ),
+                                                "unknown item in schemars contains attribute"
+                                                    .to_string(),
                                             );
                                         }
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                NestedMeta::Meta(Meta::List(meta_list)) if meta_list.path.is_ident("inner") => {
+                    match self.inner {
+                        Some(_) => duplicate_error(&meta_list.path),
+                        None => {
+                            let inner_attrs = ValidationAttrs::default().populate(
+                                meta_list.nested.clone().into_iter().collect(),
+                                attr_type,
+                                ignore_errors,
+                                errors,
+                            );
+                            self.inner = Some(Box::new(inner_attrs));
                         }
                     }
                 }
@@ -311,16 +326,24 @@ impl ValidationAttrs {
     }
 
     pub fn apply_to_schema(&self, schema_expr: &mut TokenStream) {
+        if let Some(apply_expr) = self.apply_to_schema_expr() {
+            *schema_expr = quote! {
+                {
+                    let mut schema = #schema_expr;
+                    #apply_expr
+                    schema
+                }
+            }
+        }
+    }
+
+    fn apply_to_schema_expr(&self) -> Option<TokenStream> {
         let mut array_validation = Vec::new();
         let mut number_validation = Vec::new();
         let mut object_validation = Vec::new();
         let mut string_validation = Vec::new();
 
-        if let Some(length_min) = self
-            .length_min
-            .as_ref()
-            .or_else(|| self.length_equal.as_ref())
-        {
+        if let Some(length_min) = self.length_min.as_ref().or(self.length_equal.as_ref()) {
             string_validation.push(quote! {
                 validation.min_length = Some(#length_min as u32);
             });
@@ -329,11 +352,7 @@ impl ValidationAttrs {
             });
         }
 
-        if let Some(length_max) = self
-            .length_max
-            .as_ref()
-            .or_else(|| self.length_equal.as_ref())
-        {
+        if let Some(length_max) = self.length_max.as_ref().or(self.length_equal.as_ref()) {
             string_validation.push(quote! {
                 validation.max_length = Some(#length_max as u32);
             });
@@ -380,6 +399,21 @@ impl ValidationAttrs {
             }
         });
 
+        let inner_validation = self
+            .inner
+            .as_deref()
+            .and_then(|inner| inner.apply_to_schema_expr())
+            .map(|apply_expr| {
+                quote! {
+                    if schema_object.has_type(schemars::schema::InstanceType::Array) {
+                        if let Some(schemars::schema::SingleOrVec::Single(inner_schema)) = &mut schema_object.array().items {
+                            let mut schema = &mut **inner_schema;
+                            #apply_expr
+                        }
+                    }
+                }
+            });
+
         let array_validation = wrap_array_validation(array_validation);
         let number_validation = wrap_number_validation(number_validation);
         let object_validation = wrap_object_validation(object_validation);
@@ -390,21 +424,20 @@ impl ValidationAttrs {
             || object_validation.is_some()
             || string_validation.is_some()
             || format.is_some()
+            || inner_validation.is_some()
         {
-            *schema_expr = quote! {
-                {
-                    let mut schema = #schema_expr;
-                    if let schemars::schema::Schema::Object(schema_object) = &mut schema
-                    {
-                        #array_validation
-                        #number_validation
-                        #object_validation
-                        #string_validation
-                        #format
-                    }
-                    schema
+            Some(quote! {
+                if let schemars::schema::Schema::Object(schema_object) = &mut schema {
+                    #array_validation
+                    #number_validation
+                    #object_validation
+                    #string_validation
+                    #format
+                    #inner_validation
                 }
-            }
+            })
+        } else {
+            None
         }
     }
 }

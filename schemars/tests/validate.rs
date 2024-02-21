@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use util::*;
 
 // In real code, this would typically be a Regex, potentially created in a `lazy_static!`.
-static STARTS_WITH_HELLO: &'static str = r"^[Hh]ello\b";
+static STARTS_WITH_HELLO: &str = r"^[Hh]ello\b";
 
 const MIN: u32 = 1;
 const MAX: u32 = 1000;
@@ -101,7 +101,7 @@ pub struct Struct2 {
 
 #[test]
 fn validate_schemars_attrs() -> TestResult {
-    test_default_generated_schema::<Struct>("validate_schemars_attrs")
+    test_default_generated_schema::<Struct2>("validate_schemars_attrs")
 }
 
 #[derive(JsonSchema)]
